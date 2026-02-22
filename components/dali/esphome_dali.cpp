@@ -192,7 +192,6 @@ void DaliBusComponent::create_light_component(short_addr_t short_addr, uint32_t 
     App.register_light(light_state);
     App.register_component(light_state);
     light_state->set_name(name);
-    light_state->set_object_id(id);
     light_state->set_disabled_by_default(false);
     light_state->set_restore_mode(light::LIGHT_RESTORE_DEFAULT_ON);
     light_state->add_effects({});
