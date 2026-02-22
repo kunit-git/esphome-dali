@@ -198,9 +198,9 @@ void dali::DaliLight::write_state(light::LightState *state) {
         state->current_values_as_brightness(&brightness);
     }
 
-    int dali_brightness = static_cast<uint8_t>(brightness * this->dali_level_range_) + this->dali_level_min_ - 1;
-    if (dali_brightness < 1) dali_brightness = 1;
-    if (dali_brightness > 254) dali_brightness = 254;
+    int dali_brightness = static_cast<int>(brightness * (this->dali_level_max_ - this->dali_level_min_) + this->dali_level_min_);
+    if (dali_brightness < this->dali_level_min_) dali_brightness = this->dali_level_min_;
+    if (dali_brightness > this->dali_level_max_) dali_brightness = this->dali_level_max_;
 
     ESP_LOGD(TAG, "DALI[%d] B=%.2f (%d)", address_, brightness, dali_brightness);
     bus->dali.lamp.setBrightness(address_, (uint8_t)dali_brightness);
