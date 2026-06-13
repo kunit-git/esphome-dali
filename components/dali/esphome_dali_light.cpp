@@ -1,5 +1,6 @@
 
 #include <esphome.h>
+#include <cmath>
 #include "esphome_dali_light.h"
 #include "esphome/core/log.h"
 
@@ -142,6 +143,14 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                                  (float)(this->dali_level_max_ - this->dali_level_min_);
                     if (brightness < 0.0f) brightness = 0.0f;
                     if (brightness > 1.0f) brightness = 1.0f;
+                    // write_state() receives a gamma-corrected brightness before mapping it
+                    // to a DALI level, so the restore must apply the inverse. Without this,
+                    // the restored value gets gamma-crushed a second time on the next
+                    // turn-on, mapping to a near-minimum DALI level that looks off.
+                    float gamma = state->get_gamma_correct();
+                    if (gamma > 0.0f) {
+                        brightness = powf(brightness, 1.0f / gamma);
+                    }
                 }
                 this->boot_state_.brightness = brightness;
                 ESP_LOGD(TAG, "Restore brightness level: %.2f (raw %d)", brightness, current_level);
@@ -163,19 +172,26 @@ void dali::DaliLight::setup_state(light::LightState *state) {
         }
         else {
             ESP_LOGW(TAG, "DALI device at addr %.2x not found!", address_);
-            // Device not found: don't suppress writes (nothing to restore).
-            this->writes_enabled_ = true;
-            this->boot_applied_ = true;
+            // This may be a false negative on the flaky bus, or a genuinely absent device.
+            // Either way do NOT enable writes here: that lets ESPHome's boot restore (the
+            // last-saved/default HA state) drive the bus and switch a real lamp on or off,
+            // which is exactly the boot-time toggling we must avoid. Keep writes suppressed
+            // and route through the normal boot flow - apply_boot_state() publishes a safe
+            // "off" to Home Assistant and then enables writes for normal control. The bus is
+            // never written as a side effect of booting.
+            this->boot_state_.state = false;
+            bus->register_light(this);
         }
 
         //bus->dali.dumpStatusForDevice(address_);
     }
     else {
-        // Broadcast / group addresses: we cannot read a single state back, so don't try to
-        // restore and don't suppress writes.
+        // Broadcast / group addresses: we cannot read a single state back. Still route
+        // through the suppressed boot flow so the restore never drives the bus on boot;
+        // apply_boot_state() publishes "off" and then enables writes for normal control.
         // TODO: How do we detect color temperature support for broadcast and group addresses?
-        this->writes_enabled_ = true;
-        this->boot_applied_ = true;
+        this->boot_state_.state = false;
+        bus->register_light(this);
     }
 
 

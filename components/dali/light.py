@@ -8,7 +8,8 @@ from esphome.const import (
     CONF_COLD_WHITE_COLOR_TEMPERATURE,
     CONF_WARM_WHITE_COLOR_TEMPERATURE,
     CONF_COLOR_MODE,
-    CONF_DEFAULT_TRANSITION_LENGTH
+    CONF_DEFAULT_TRANSITION_LENGTH,
+    CONF_GAMMA_CORRECT
 )
 
 import esphome.codegen as cg
@@ -101,6 +102,11 @@ def validate_fade_rate(value):
 
 CONFIG_SCHEMA = light.LIGHT_SCHEMA.extend({
     cv.GenerateID(CONF_OUTPUT_ID): cv.declare_id(DaliLight),
+
+    # DALI control gear applies its own (typically logarithmic) dimming curve, so
+    # ESPHome's default gamma of 2.8 would double-correct and make low/mid levels
+    # nearly dark. Default to a linear mapping; can still be overridden per light.
+    cv.Optional(CONF_GAMMA_CORRECT, default=1.0): cv.positive_float,
 
     cv.Optional(CONF_COLD_WHITE_COLOR_TEMPERATURE, default='10000K'): cv.color_temperature,
     cv.Optional(CONF_WARM_WHITE_COLOR_TEMPERATURE, default='2700K'): cv.color_temperature,
