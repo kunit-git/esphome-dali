@@ -38,6 +38,11 @@ class DaliLight : public light::LightOutput, public Component {
     void setup_state(light::LightState *state) override;
     void write_state(light::LightState *state) override;
 
+    /// @brief Publish the lamp's actual hardware state (read during setup_state) to
+    /// Home Assistant without writing to the bus, then enable normal bus writes.
+    /// Called once by the bus component after all components have finished setup.
+    void apply_boot_state();
+
     void set_address(uint8_t address) { 
         address_ = address; 
 
@@ -60,8 +65,18 @@ class DaliLight : public light::LightOutput, public Component {
     // NOTE: Must have a lower priority number than the DALI bus component
     float get_setup_priority() const override { return setup_priority::DATA; }
 
+    bool boot_applied() const { return boot_applied_; }
+
  protected:
     DaliBusComponent *bus;
+
+    // Boot-state handling: the bus is never written during setup. Instead we read the
+    // lamp's actual state in setup_state(), publish it via apply_boot_state(), and only
+    // then allow write_state() to drive the bus.
+    light::LightState *state_{nullptr};
+    light::LightStateRTCState boot_state_{};
+    bool writes_enabled_{false};
+    bool boot_applied_{false};
 
     uint8_t address_;
     optional<uint16_t> fade_time_;

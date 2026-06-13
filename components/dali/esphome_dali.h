@@ -1,10 +1,15 @@
 #pragma once
 
 #include <esphome.h>
+#include <vector>
 #include "dali.h"
 
 namespace esphome {
 namespace dali {
+
+// Forward declaration: DaliLight depends on this component, and this component
+// keeps a registry of the lights so it can drive their boot-state sync.
+class DaliLight;
 
 enum class DaliInitMode {
     DiscoverOnly,
@@ -47,6 +52,9 @@ public:
         }
     }
 
+    /// @brief Register a light so the bus can sync its boot state once setup is complete.
+    void register_light(DaliLight* light) { m_lights.push_back(light); }
+
     DaliMaster dali;
 
 public: // DaliPort
@@ -67,6 +75,7 @@ private:
     bool m_discovery = false;
     DaliInitMode m_initialize_addresses = DaliInitMode::DiscoverOnly;
     uint32_t m_addresses[ADDR_SHORT_MAX+1] = {0};
+    std::vector<DaliLight*> m_lights;
 };
 
 }  // namespace dali

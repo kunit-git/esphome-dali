@@ -176,35 +176,27 @@ void DaliBusComponent::setup() {
 }
 
 void DaliBusComponent::create_light_component(short_addr_t short_addr, uint32_t long_addr) {
-#ifdef USE_LIGHT
-    DaliLight* dali_light = new DaliLight { this };
-    dali_light->set_address(short_addr);
-
-    const int MAX_STR_LEN = 20;
-    char* name = new char[MAX_STR_LEN];
-    char* id = new char[MAX_STR_LEN];
-    snprintf(name, MAX_STR_LEN, "DALI Light %d", short_addr);
-    snprintf(id, MAX_STR_LEN, "dali_light_%.6x", long_addr);
-    // NOTE: Not freeing these strings, they will be owned by LightState.
-
-    auto* light_state = new light::LightState { dali_light };
-    light_state->set_component_source(LOG_STR("light"));
-    App.register_light(light_state);
-    App.register_component(light_state);
-    light_state->set_name(name);
-    light_state->set_disabled_by_default(false);
-    light_state->set_restore_mode(light::LIGHT_RESTORE_DEFAULT_ON);
-    light_state->add_effects({});
-
-    DALI_LOGI("Created light component '%s' (%s)", name, id);
-#else
-    // Make sure you set discovery: true, or specify a light component somewhere in your YAML!
-    DALI_LOGE("Cannot add light component - not enabled");
-#endif
+    // Runtime creation of light entities is no longer supported by ESPHome (entity
+    // registration is compile-time only). Discovery is therefore informational: log each
+    // device that isn't already defined in YAML so the user can add a matching light block.
+    DALI_LOGI("Discovered DALI device %.6x at short address %d", long_addr, short_addr);
+    DALI_LOGI("  Add to YAML to control it:");
+    DALI_LOGI("    light:");
+    DALI_LOGI("      - platform: dali");
+    DALI_LOGI("        name: \"DALI Light %d\"", short_addr);
+    DALI_LOGI("        address: %d", short_addr);
 }
 
 void DaliBusComponent::loop() {
-
+    // Once all components have finished setup, publish each lamp's real (already-read)
+    // state to Home Assistant and enable normal bus writes. Done from the bus loop because
+    // dynamically created lights don't reliably get their own loop() called. Iterating every
+    // loop (rather than one-shot) also covers lights that register slightly late.
+    for (auto* light : m_lights) {
+        if (!light->boot_applied()) {
+            light->apply_boot_state();
+        }
+    }
 }
 
 void DaliBusComponent::dump_config() {
