@@ -19,7 +19,19 @@ void dali::DaliLight::setup_state(light::LightState *state) {
     // Exclude broadcast and group addresses
     if ((this->address_ != ADDR_BROADCAST) && ((this->address_ & ADDR_GROUP_MASK) == 0)) {
         ESP_LOGD(TAG, "Querying DALI device capabilities...");
-        if (bus->dali.isDevicePresent(address_)) {
+        // The bit-banged bus can NACK a single query (especially the first transaction
+        // after boot), so retry presence detection before giving up. A false negative here
+        // is dangerous: it takes the "not found" path below, which enables writes and lets
+        // ESPHome's restore (default OFF) turn the lamp off - the exact thing we must avoid.
+        bool present = false;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (bus->dali.isDevicePresent(address_)) {
+                present = true;
+                break;
+            }
+            delay(10);
+        }
+        if (present) {
             ESP_LOGD(TAG, "DALI[%.2x] Is Present", address_);
 
             // Query the min/max brightness range. The bit-banged bus can occasionally NACK,
@@ -106,7 +118,18 @@ void dali::DaliLight::setup_state(light::LightState *state) {
             // Query the lamp's actual state so we can reflect it (and NOT overwrite it) on
             // boot. We deliberately do not write the bus here - apply_boot_state() will
             // publish this to Home Assistant once setup completes.
-            uint8_t current_level = bus->dali.lamp.getCurrentLevel(address_);
+            // Same flaky-bus caveat as above: a NACK reads back as 0, which is
+            // indistinguishable from a genuine "off" and would mis-report the lamp as off.
+            // Retry, preferring a valid level (1..254); only conclude off if reads are
+            // consistently 0 (the device is present, so the bus is communicating).
+            uint8_t current_level = 0;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                uint8_t lvl = bus->dali.lamp.getCurrentLevel(address_);
+                current_level = lvl;
+                if (lvl != 0 && lvl != 0xFF) {
+                    break;
+                }
+            }
 
             // 0xFF (MASK) means "unknown" - treat as off. Level 0 is off.
             bool is_on = (current_level != 0 && current_level != 0xFF);
@@ -183,6 +206,10 @@ void dali::DaliLight::apply_boot_state() {
         // in the LightCall. On/off + brightness are the states we must get right.
         call.set_save(false);
         call.set_publish(true);
+        // No fade: this is a state-reflection publish, not a real change. A transition would
+        // keep driving write_state() from loop() after we flip writes_enabled_ below, which
+        // could push the bus toward the (possibly off) boot value.
+        call.set_transition_length(0);
         call.perform();
     }
 
