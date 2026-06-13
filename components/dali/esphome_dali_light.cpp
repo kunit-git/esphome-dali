@@ -34,6 +34,15 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                     break;
                 }
             }
+            // DAPC level 0xFF (255) is the "MASK"/stop-fading value and is NOT a real
+            // arc-power level - valid levels are 1..254. A gear reporting 255 as its max
+            // (or a misread on the bit-banged bus) would otherwise make the "on" command
+            // at 100% map to DALI level 255, which the lamp ignores - so it could be turned
+            // off but never back on at full brightness.
+            if (max_level == 0xFF) {
+                ESP_LOGW(TAG, "DALI[%.2x] Reported max 255 (MASK), capping to 254", address_);
+                max_level = 254;
+            }
             if (min_level == 0 || max_level == 0 || min_level > max_level) {
                 ESP_LOGW(TAG, "DALI[%.2x] Invalid min/max (%d/%d), using defaults 1/254",
                          address_, min_level, max_level);
@@ -274,9 +283,10 @@ void dali::DaliLight::write_state(light::LightState *state) {
     if (dali_brightness < this->dali_level_min_) dali_brightness = this->dali_level_min_;
     if (dali_brightness > this->dali_level_max_) dali_brightness = this->dali_level_max_;
 
-    // Safety net: an "on" state must never emit DALI level 0 (== OFF), otherwise the lamp
-    // could be turned off but never on.
+    // Safety net: an "on" state must never emit DALI level 0 (== OFF) nor 255 (== MASK /
+    // stop-fading, a no-op), otherwise the lamp could be turned off but never on.
     if (dali_brightness < 1) dali_brightness = 1;
+    if (dali_brightness > 254) dali_brightness = 254;
 
     ESP_LOGD(TAG, "DALI[%d] B=%.2f (%d)", address_, brightness, dali_brightness);
     bus->dali.lamp.setBrightness(address_, (uint8_t)dali_brightness);
