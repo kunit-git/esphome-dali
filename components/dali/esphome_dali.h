@@ -65,7 +65,6 @@ public: // DaliPort
 private:
     void writeBit(bool bit);
     void writeByte(uint8_t b);
-    uint8_t readByte();
 
     void create_light_component(short_addr_t short_addr, uint32_t long_addr);
 
@@ -76,6 +75,10 @@ private:
     DaliInitMode m_initialize_addresses = DaliInitMode::DiscoverOnly;
     uint32_t m_addresses[ADDR_SHORT_MAX+1] = {0};
     std::vector<DaliLight*> m_lights;
+
+    // Periodic lamp-state logging (one lamp per tick, each lamp once a minute)
+    uint32_t m_last_status_poll = 0;
+    size_t m_status_poll_index = 0;
 };
 
 }  // namespace dali

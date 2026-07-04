@@ -130,34 +130,44 @@ void dali::DaliLight::setup_state(light::LightState *state) {
             // Query the lamp's actual state so we can reflect it (and NOT overwrite it) on
             // boot. We deliberately do not write the bus here - apply_boot_state() will
             // publish this to Home Assistant once setup completes.
-            // A single read is not trustworthy on the bit-banged bus: a NACK reads back
-            // as 0 (looks "off") and line noise can read back as a random non-zero byte
-            // (looks "on"). Keep reading until two consecutive reads agree; a stray
-            // corrupted byte then can't flip the reported state in either direction.
-            uint8_t current_level = 0;
-            {
-                uint8_t prev = 0;
-                bool have_prev = false;
-                for (int attempt = 0; attempt < 6; attempt++) {
-                    uint8_t lvl = bus->dali.lamp.getCurrentLevel(address_);
-                    if (have_prev && lvl == prev) {
-                        current_level = lvl;
-                        break;
-                    }
-                    prev = lvl;
-                    have_prev = true;
-                    current_level = lvl; // best effort if no two reads ever agree
-                    delay(5);
-                }
+            //
+            // On/off is decided by QUERY LAMP POWER ON, not by the actual-level query:
+            // some gear/bus timing yields a consistent non-zero level byte even while the
+            // lamp is off, which made Home Assistant report off lamps as on. QUERY LAMP
+            // POWER ON answers "yes" as exactly 0xFF and an off lamp sends no reply at
+            // all (reads 0), so neither a NACK nor line noise can fabricate an "on".
+            bool is_on = false;
+            for (int attempt = 0; attempt < 3 && !is_on; attempt++) {
+                is_on = bus->dali.lamp.isLampPoweredOn(address_);
             }
-
-            // 0xFF (MASK) means "unknown" - treat as off. Level 0 is off.
-            bool is_on = (current_level != 0 && current_level != 0xFF);
             this->boot_state_.state = is_on;
+
             if (is_on) {
+                // Read the brightness. A single read is not trustworthy on the bit-banged
+                // bus, so keep reading until two consecutive reads agree.
+                uint8_t current_level = 0;
+                {
+                    uint8_t prev = 0;
+                    bool have_prev = false;
+                    for (int attempt = 0; attempt < 6; attempt++) {
+                        uint8_t lvl = bus->dali.lamp.getCurrentLevel(address_);
+                        if (have_prev && lvl == prev) {
+                            current_level = lvl;
+                            break;
+                        }
+                        prev = lvl;
+                        have_prev = true;
+                        current_level = lvl; // best effort if no two reads ever agree
+                        delay(5);
+                    }
+                }
+
                 // Inverse of write_state()'s min..max mapping, clamped to 0..1.
+                // 0 and 0xFF (MASK) are not valid levels for a lamp we know is on -
+                // fall back to full brightness rather than guessing.
                 float brightness = 1.0f;
-                if (this->dali_level_max_ > this->dali_level_min_) {
+                if (current_level != 0 && current_level != 0xFF &&
+                    this->dali_level_max_ > this->dali_level_min_) {
                     brightness = (float)(current_level - this->dali_level_min_) /
                                  (float)(this->dali_level_max_ - this->dali_level_min_);
                     if (brightness < 0.0f) brightness = 0.0f;
@@ -175,7 +185,10 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                 // LightCall would coerce back to "off" - keep it publishable as "on".
                 if (brightness < 0.01f) brightness = 0.01f;
                 this->boot_state_.brightness = brightness;
-                ESP_LOGD(TAG, "Restore brightness level: %.2f (raw %d)", brightness, current_level);
+                ESP_LOGD(TAG, "DALI[%.2x] Restore: on, brightness %.2f (raw level %d)",
+                         address_, brightness, current_level);
+            } else {
+                ESP_LOGD(TAG, "DALI[%.2x] Restore: off", address_);
             }
 
             // NOTE: RGB(W) channel levels are intentionally not restored on boot: reading
@@ -230,6 +243,44 @@ void dali::DaliLight::setup_state(light::LightState *state) {
     //         ESP_LOGD(TAG, "Override: disable color temperature support");
     //     }
     // }
+}
+
+void dali::DaliLight::log_lamp_state() {
+    if ((this->address_ == ADDR_BROADCAST) || ((this->address_ & ADDR_GROUP_MASK) != 0)) {
+        return; // No single lamp state to read for group/broadcast addresses
+    }
+
+    // Live status poll, driven once a minute per lamp from the bus loop(). Queries are
+    // deliberately single-shot (no retry loops): this is informational logging, and each
+    // extra query blocks the main loop for another bus frame round-trip.
+    // Raw bytes are included for bus diagnostics: power_on answers "yes" as exactly
+    // 0xFF ("no" = no reply, reads 0); status bit2 mirrors "lamp arc power on".
+    uint8_t power_on = bus->sendQueryCommand(address_, DaliCommand::QUERY_LAMP_POWER_ON);
+    uint8_t status = bus->sendQueryCommand(address_, DaliCommand::QUERY_STATUS);
+
+    if (power_on != 0xFF) {
+        ESP_LOGI(TAG, "DALI[%.2x] Lamp state: OFF (power_on=0x%02x, status=0x%02x)",
+                 address_, power_on, status);
+        return;
+    }
+
+    uint8_t level = bus->dali.lamp.getCurrentLevel(address_);
+    if (rgb_supported_) {
+        uint8_t r = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportRedDimLevel);
+        uint8_t g = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportGreenDimLevel);
+        uint8_t b = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportBlueDimLevel);
+        if (rgbw_supported_) {
+            uint8_t w = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportWhiteDimLevel);
+            ESP_LOGI(TAG, "DALI[%.2x] Lamp state: ON, level %d/%d, RGBW=(%d,%d,%d,%d) (status=0x%02x)",
+                     address_, level, dali_level_max_, r, g, b, w, status);
+        } else {
+            ESP_LOGI(TAG, "DALI[%.2x] Lamp state: ON, level %d/%d, RGB=(%d,%d,%d) (status=0x%02x)",
+                     address_, level, dali_level_max_, r, g, b, status);
+        }
+    } else {
+        ESP_LOGI(TAG, "DALI[%.2x] Lamp state: ON, level %d/%d (status=0x%02x)",
+                 address_, level, dali_level_max_, status);
+    }
 }
 
 void dali::DaliLight::apply_boot_state() {

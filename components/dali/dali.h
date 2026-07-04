@@ -43,7 +43,9 @@ typedef uint8_t short_addr_t;
 
 #define ADDR_BROADCAST (0x7F)       // 1111 111
 #define ADDR_GROUP     (0x40)       // 100x xxx
-#define ADDR_GROUP_MASK (0x70)       // 111x xxx
+// Logical group addresses carry bit 6 (0x40 | group), encoded on the wire as 100G GGGS.
+// NOTE: Must not include bits 0x30, or short addresses 16..63 get misclassified as groups!
+#define ADDR_GROUP_MASK (0x40)       // 01xx xxxx
 #define ADDR_SHORT_MAX  (63)
 
 #define DALI_COMMAND    (0x01)
@@ -587,6 +589,13 @@ public:
         return port.sendQueryCommand(short_addr, DaliCommand::QUERY_ACTUAL_LEVEL);
     }
 
+    /// @brief Query whether the lamp is currently emitting light (arc power on)
+    /// @remark "Yes" is answered as exactly 0xFF; an off lamp sends no reply (reads 0),
+    ///         so a NACK or line noise cannot fabricate an "on".
+    bool isLampPoweredOn(short_addr_t short_addr) {
+        return port.sendQueryCommand(short_addr, DaliCommand::QUERY_LAMP_POWER_ON) == 0xFF;
+    }
+
     void setMinLevel(short_addr_t short_addr, uint8_t level) {
         port.setDtr0(level);
         if (port.getDtr0(short_addr) != level) {
@@ -839,6 +848,14 @@ public:
         uint8_t msb = port.sendExtendedQuery(short_addr, DaliColorCommand::QUERY_COLOR_VALUE);
         uint8_t lsb = port.getDtr0(short_addr);
         return (uint16_t)(msb << 8u) | (uint16_t)lsb;
+    }
+
+    /// @brief Query a reported 8-bit dim level (e.g. RGBWAF channel levels)
+    /// @param param One of the Report*DimLevel colour values
+    /// @return 0..254 dim level; 255 = MASK (unknown / not applicable)
+    /// @remark 8-bit dim levels are carried in the MSB of the 16-bit colour value
+    uint8_t getReportedDimLevel(short_addr_t short_addr, DaliColorParam param) {
+        return (uint8_t)(queryParameter(short_addr, param) >> 8);
     }
 
     /// @brief Query color temperature

@@ -47,6 +47,10 @@ class DaliLight : public light::LightOutput, public Component {
     /// Called once by the bus component after all components have finished setup.
     void apply_boot_state();
 
+    /// @brief Query the lamp's live state from the bus and log it (on/off, level,
+    /// RGB(W) if applicable). Driven periodically by the bus component's loop().
+    void log_lamp_state();
+
     void set_address(uint8_t address) { 
         address_ = address; 
 
