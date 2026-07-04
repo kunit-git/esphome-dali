@@ -54,7 +54,7 @@ light:
   - platform: dali
     name: "DALI Light 0"
     address: 0
-    # color_mode: BRIGHTNESS          # force a mode, or omit to auto-detect (e.g. COLOR_TEMPERATURE)
+    # color_mode: BRIGHTNESS          # force a mode (ON_OFF, BRIGHTNESS, COLOR_TEMPERATURE, RGB, RGBW), or omit to auto-detect
     # gamma_correct: 1.0              # default; the DALI gear applies its own dimming curve
     # fade_time: 1s
     # cold_white_color_temperature: 4000K

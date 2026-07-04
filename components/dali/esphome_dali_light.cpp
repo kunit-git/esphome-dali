@@ -69,7 +69,18 @@ void dali::DaliLight::setup_state(light::LightState *state) {
 
             // NOTE: Some DALI controllers report their device type is LED(6) even though they do also support color temperature,
             // so let's explicitly check if they respond to this:
-            this->tc_supported_ = bus->dali.color.isTcCapable(address_);
+            uint8_t color_features = bus->dali.color.getColorFeatures(address_);
+            this->tc_supported_ = (color_features & (uint8_t)DaliColorFeature::TC_CAPABLE) != 0;
+
+            // DT8 RGBWAF: bits 5-7 report the number of colour channels (3=RGB, 4+=RGBW)
+            uint8_t rgbwaf_channels = (color_features >> 5) & 0x07;
+            this->rgb_supported_ = (rgbwaf_channels >= 3);
+            this->rgbw_supported_ = (rgbwaf_channels >= 4);
+            if (rgb_supported_) {
+                ESP_LOGD(TAG, "DALI[%.2x] Supports RGB%s (%d RGBWAF channels)",
+                         address_, rgbw_supported_ ? "W" : "", rgbwaf_channels);
+            }
+
             if (tc_supported_) {
                 ESP_LOGD(TAG, "DALI[%.2x] Supports color temperature", address_);
 
@@ -156,6 +167,10 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                 ESP_LOGD(TAG, "Restore brightness level: %.2f (raw %d)", brightness, current_level);
             }
 
+            // NOTE: RGB(W) channel levels are intentionally not restored on boot: reading
+            // them back needs 4-6 QUERY_COLOR_VALUE round-trips on the flaky bit-banged
+            // bus, and the byte layout of 8-bit dim levels in the 16-bit colour value
+            // register varies between gear. On/off + brightness are the states that matter.
             if (tc_supported_) {
                 uint16_t current_temperature = bus->dali.color.getColorTemperature(address_);
                 if (current_temperature != 0) {
@@ -246,43 +261,84 @@ light::LightTraits dali::DaliLight::get_traits() {
     // or force colour temperature support and hope the device recognizes the command...
     if (this->color_mode_.has_value()) {
         switch (this->color_mode_.value()) {
-            case DaliColorMode::COLOR_TEMPERATURE: 
+            case DaliColorMode::COLOR_TEMPERATURE:
                 this->tc_supported_ = true;
+                this->rgb_supported_ = false;
+                this->rgbw_supported_ = false;
                 traits.set_supported_color_modes({light::ColorMode::COLOR_TEMPERATURE});
                 traits.set_min_mireds(this->cold_white_temperature_);
                 traits.set_max_mireds(this->warm_white_temperature_);
                 break;
+            case DaliColorMode::RGB:
+                this->tc_supported_ = false;
+                this->rgb_supported_ = true;
+                this->rgbw_supported_ = false;
+                traits.set_supported_color_modes({light::ColorMode::RGB});
+                break;
+            case DaliColorMode::RGBW:
+                this->tc_supported_ = false;
+                this->rgb_supported_ = true;
+                this->rgbw_supported_ = true;
+                traits.set_supported_color_modes({light::ColorMode::RGB_WHITE});
+                break;
             case DaliColorMode::BRIGHTNESS:
                 this->tc_supported_ = false;
+                this->rgb_supported_ = false;
+                this->rgbw_supported_ = false;
                 traits.set_supported_color_modes({light::ColorMode::BRIGHTNESS});
                 break;
             case DaliColorMode::ON_OFF:
                 this->tc_supported_ = false;
+                this->rgb_supported_ = false;
+                this->rgbw_supported_ = false;
                 traits.set_supported_color_modes({light::ColorMode::ON_OFF});
                 break;
         }
     }
     else {
-        // Device reports color temperature support
-        if (this->tc_supported_) {
+        // Use what the device reported during setup. A DT8 gear can support several
+        // colour types (e.g. RGBWAF and Tc); expose each as a Home Assistant mode.
+        // NOTE: Built via the initializer-list overload, which exists in both the old
+        // (std::set) and new (ColorModeMask) LightTraits APIs.
+        if (this->rgbw_supported_) {
+            if (this->tc_supported_) {
+                traits.set_supported_color_modes({light::ColorMode::RGB_WHITE, light::ColorMode::COLOR_TEMPERATURE});
+            } else {
+                traits.set_supported_color_modes({light::ColorMode::RGB_WHITE});
+            }
+        } else if (this->rgb_supported_) {
+            if (this->tc_supported_) {
+                traits.set_supported_color_modes({light::ColorMode::RGB, light::ColorMode::COLOR_TEMPERATURE});
+            } else {
+                traits.set_supported_color_modes({light::ColorMode::RGB});
+            }
+        } else if (this->tc_supported_) {
             traits.set_supported_color_modes({light::ColorMode::COLOR_TEMPERATURE});
+        } else {
+            traits.set_supported_color_modes({light::ColorMode::BRIGHTNESS});
+        }
+
+        if (this->tc_supported_) {
             traits.set_min_mireds(this->cold_white_temperature_);
             traits.set_max_mireds(this->warm_white_temperature_);
-        }
-        else {
-            traits.set_supported_color_modes({light::ColorMode::BRIGHTNESS});
         }
     }
 
     return traits;
 }
 
+// Map a 0..1 colour channel value to a DALI RGBWAF dim level (0..254; 255 is MASK)
+static inline uint8_t to_dali_channel(float value) {
+    int level = static_cast<int>(value * 254.0f + 0.5f);
+    if (level < 0) level = 0;
+    if (level > 254) level = 254;
+    return (uint8_t)level;
+}
+
 void dali::DaliLight::write_state(light::LightState *state) {
     bool on;
     float brightness;
     float color_temperature;
-
-    static uint16_t last_temperature = 0;
 
     // Suppress writes until the boot state has been read and published. This prevents
     // ESPHome's setup-time call.perform() (and apply_boot_state()) from resetting the lamp
@@ -299,7 +355,45 @@ void dali::DaliLight::write_state(light::LightState *state) {
         return;
     }
 
-    if (tc_supported_) {
+    auto color_mode = state->current_values.get_color_mode();
+
+    if (rgb_supported_ && (color_mode & light::ColorCapability::RGB)) {
+        const auto& values = state->current_values;
+
+        // The RGBWAF dim levels define the colour point only; overall intensity is
+        // driven by the DAPC (arc power) frame below. color_brightness carries the
+        // magnitude of the HA-requested RGB colour (ESPHome normalizes rgb so that
+        // max(r,g,b) == 1), so it must be folded back into the channel levels.
+        float color_brightness = values.get_color_brightness();
+        uint8_t r = to_dali_channel(values.get_red() * color_brightness);
+        uint8_t g = to_dali_channel(values.get_green() * color_brightness);
+        uint8_t b = to_dali_channel(values.get_blue() * color_brightness);
+
+        bool is_rgbw = rgbw_supported_ && (color_mode & light::ColorCapability::WHITE);
+        uint8_t w = is_rgbw ? to_dali_channel(values.get_white()) : 0;
+
+        // Only update if the colour has changed, to allow faster brightness changes
+        if (!last_color_valid_ ||
+            r != last_rgbw_[0] || g != last_rgbw_[1] || b != last_rgbw_[2] || w != last_rgbw_[3]) {
+            last_color_valid_ = true;
+            last_rgbw_[0] = r;
+            last_rgbw_[1] = g;
+            last_rgbw_[2] = b;
+            last_rgbw_[3] = w;
+
+            ESP_LOGD(TAG, "DALI[%d] RGBW=(%d,%d,%d,%d)", address_, r, g, b, w);
+
+            // IMPORTANT: Do not set start_fade (activate), or the color fade will be
+            // cancelled when we next call setBrightness, and no color change will occur.
+            // The DAPC frame below activates the temporary colour values.
+            bus->dali.color.setRGB(address_, r, g, b, false);
+            if (is_rgbw) {
+                // Amber/Freecolour channels (if any) are left unchanged (MASK)
+                bus->dali.color.setWAF(address_, w, 0xFF, 0xFF, false);
+            }
+        }
+    }
+    else if (tc_supported_ && (color_mode & light::ColorCapability::COLOR_TEMPERATURE)) {
         state->current_values_as_ct(&color_temperature, &brightness);
 
         // Map temperature 0..1 to reported TC coolest/warmest mireds
@@ -309,8 +403,8 @@ void dali::DaliLight::write_state(light::LightState *state) {
         uint16_t dali_color_temperature = static_cast<uint16_t>(color_temperature_mired);
 
         // Only update if temperature has changed, to allow faster brightness changes
-        if (dali_color_temperature != last_temperature) {
-            last_temperature = dali_color_temperature;
+        if (dali_color_temperature != last_temperature_) {
+            last_temperature_ = dali_color_temperature;
 
             ESP_LOGD(TAG, "DALI[%d] Tc=%d", address_, dali_color_temperature);
 
@@ -318,9 +412,9 @@ void dali::DaliLight::write_state(light::LightState *state) {
             // be cancelled when we next call setBrightness, and no color change will occur.
             bus->dali.color.setColorTemperature(address_, dali_color_temperature, false);
         }
-    } else {
-        state->current_values_as_brightness(&brightness);
     }
+
+    state->current_values_as_brightness(&brightness);
 
     int dali_brightness = static_cast<int>(brightness * (this->dali_level_max_ - this->dali_level_min_) + this->dali_level_min_);
     if (dali_brightness < this->dali_level_min_) dali_brightness = this->dali_level_min_;

@@ -31,6 +31,8 @@ DALI_COLOR_MODES = {
     "ON_OFF": DaliColorMode.ON_OFF,
     "BRIGHTNESS": DaliColorMode.BRIGHTNESS,
     "COLOR_TEMPERATURE": DaliColorMode.COLOR_TEMPERATURE,
+    "RGB": DaliColorMode.RGB,
+    "RGBW": DaliColorMode.RGBW,
 }
 
 # enum is defined in library dali.h

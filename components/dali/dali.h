@@ -762,13 +762,50 @@ public:
     }
 
     /// @brief Supports XY color coordinates
-    /// @param short_addr 
-    /// @return 
+    /// @param short_addr
+    /// @return
     bool isXYCapable(short_addr_t short_addr) {
         return (port.sendExtendedQuery(short_addr, DaliColorCommand::QUERY_COLOR_FEATURES) & (uint8_t)DaliColorFeature::XY_CAPABLE) != 0;
     }
 
-    // TODO: RGB??
+    /// @brief Query the raw color features byte
+    /// @remark bit0: XY capable, bit1: Tc capable, bits2-4: number of primaries,
+    ///         bits5-7: number of RGBWAF channels (3=RGB, 4=RGBW, 5=+Amber, 6=+Freecolour)
+    uint8_t getColorFeatures(short_addr_t short_addr) {
+        return port.sendExtendedQuery(short_addr, DaliColorCommand::QUERY_COLOR_FEATURES);
+    }
+
+    /// @brief Set the temporary RGB dim levels (RGBWAF colour type)
+    /// @param short_addr Device short address
+    /// @param r,g,b Channel dim levels 0..254, or 0xFF (MASK) to leave a channel unchanged
+    /// @param start_fade If false, the caller must activate the colour change itself,
+    ///        either via ACTIVATE or by sending a DAPC (brightness) frame
+    void setRGB(short_addr_t short_addr, uint8_t r, uint8_t g, uint8_t b, bool start_fade = true) {
+        port.setDtr0(r);
+        port.setDtr1(g);
+        port.setDtr2(b);
+        port.sendExtendedCommand(short_addr, DaliColorCommand::SET_RGB_DIM_LEVEL);
+
+        if (start_fade) {
+            port.sendExtendedCommand(short_addr, DaliColorCommand::ACTIVATE);
+        }
+    }
+
+    /// @brief Set the temporary White/Amber/Freecolour dim levels (RGBWAF colour type)
+    /// @param short_addr Device short address
+    /// @param w,a,f Channel dim levels 0..254, or 0xFF (MASK) to leave a channel unchanged
+    /// @param start_fade If false, the caller must activate the colour change itself,
+    ///        either via ACTIVATE or by sending a DAPC (brightness) frame
+    void setWAF(short_addr_t short_addr, uint8_t w, uint8_t a = 0xFF, uint8_t f = 0xFF, bool start_fade = true) {
+        port.setDtr0(w);
+        port.setDtr1(a);
+        port.setDtr2(f);
+        port.sendExtendedCommand(short_addr, DaliColorCommand::SET_WAF_DIM_LEVEL);
+
+        if (start_fade) {
+            port.sendExtendedCommand(short_addr, DaliColorCommand::ACTIVATE);
+        }
+    }
 
     /// @brief Set color temperature
     /// @param short_addr Device short address

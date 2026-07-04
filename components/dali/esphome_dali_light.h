@@ -12,6 +12,8 @@ enum class DaliColorMode {
     ON_OFF,
     BRIGHTNESS,
     COLOR_TEMPERATURE,
+    RGB,
+    RGBW,
 };
 
 class DaliLight : public light::LightOutput, public Component {
@@ -24,6 +26,8 @@ class DaliLight : public light::LightOutput, public Component {
         , cold_white_temperature_(100.0f) // 10000K
         , warm_white_temperature_(370.0f) // 2700K
         , tc_supported_(false)
+        , rgb_supported_(false)
+        , rgbw_supported_(false)
         , dali_tc_coolest_(COLOR_MIREK_COOLEST)
         , dali_tc_warmest_(400.0f)
         , dali_level_min_(1)
@@ -93,7 +97,15 @@ class DaliLight : public light::LightOutput, public Component {
     optional<DaliLedDimmingCurve> brightness_curve_;
 
     bool tc_supported_;
-    
+    bool rgb_supported_;
+    bool rgbw_supported_;
+
+    // Last colour values sent to the gear, so brightness-only changes don't re-send
+    // the (slow, multi-frame) colour commands. Per-instance on purpose: a shared
+    // static would make multiple lamps suppress each other's colour updates.
+    uint16_t last_temperature_{0};
+    uint8_t last_rgbw_[4]{};
+    bool last_color_valid_{false};
 };
 
 }  // namespace dali
