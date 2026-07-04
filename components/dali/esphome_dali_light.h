@@ -81,6 +81,9 @@ class DaliLight : public light::LightOutput, public Component {
     light::LightStateRTCState boot_state_{};
     bool writes_enabled_{false};
     bool boot_applied_{false};
+    // One-shot: swallow the single write_state() queued by the boot-state publish in
+    // apply_boot_state(), so reflecting the lamp's state never writes to the bus.
+    bool boot_write_guard_{false};
 
     uint8_t address_;
     optional<uint16_t> fade_time_;

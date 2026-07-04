@@ -130,16 +130,24 @@ void dali::DaliLight::setup_state(light::LightState *state) {
             // Query the lamp's actual state so we can reflect it (and NOT overwrite it) on
             // boot. We deliberately do not write the bus here - apply_boot_state() will
             // publish this to Home Assistant once setup completes.
-            // Same flaky-bus caveat as above: a NACK reads back as 0, which is
-            // indistinguishable from a genuine "off" and would mis-report the lamp as off.
-            // Retry, preferring a valid level (1..254); only conclude off if reads are
-            // consistently 0 (the device is present, so the bus is communicating).
+            // A single read is not trustworthy on the bit-banged bus: a NACK reads back
+            // as 0 (looks "off") and line noise can read back as a random non-zero byte
+            // (looks "on"). Keep reading until two consecutive reads agree; a stray
+            // corrupted byte then can't flip the reported state in either direction.
             uint8_t current_level = 0;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                uint8_t lvl = bus->dali.lamp.getCurrentLevel(address_);
-                current_level = lvl;
-                if (lvl != 0 && lvl != 0xFF) {
-                    break;
+            {
+                uint8_t prev = 0;
+                bool have_prev = false;
+                for (int attempt = 0; attempt < 6; attempt++) {
+                    uint8_t lvl = bus->dali.lamp.getCurrentLevel(address_);
+                    if (have_prev && lvl == prev) {
+                        current_level = lvl;
+                        break;
+                    }
+                    prev = lvl;
+                    have_prev = true;
+                    current_level = lvl; // best effort if no two reads ever agree
+                    delay(5);
                 }
             }
 
@@ -163,6 +171,9 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                         brightness = powf(brightness, 1.0f / gamma);
                     }
                 }
+                // A lamp sitting at its minimum level maps to brightness 0, which a
+                // LightCall would coerce back to "off" - keep it publishable as "on".
+                if (brightness < 0.01f) brightness = 0.01f;
                 this->boot_state_.brightness = brightness;
                 ESP_LOGD(TAG, "Restore brightness level: %.2f (raw %d)", brightness, current_level);
             }
@@ -226,9 +237,10 @@ void dali::DaliLight::apply_boot_state() {
         return;
     }
 
-    // Publish the lamp's actual hardware state to Home Assistant. The LightCall triggers
-    // write_state(), but writes_enabled_ is still false so the bus is NOT touched - the
-    // physical lamp keeps whatever state it powered up in.
+    // Publish the lamp's actual hardware state to Home Assistant. NOTE: the LightCall
+    // queues one write_state() for the *next* loop iteration - after writes_enabled_ has
+    // been flipped below - so the boot_write_guard_ set below is what actually keeps this
+    // publish off the bus. The physical lamp keeps whatever state it powered up in.
     if (this->state_ != nullptr) {
         auto call = this->state_->make_call();
         call.set_state(this->boot_state_.state);
@@ -245,6 +257,10 @@ void dali::DaliLight::apply_boot_state() {
     }
 
     this->boot_applied_ = true;
+    // The perform() above queued exactly one write_state() (immediate, transition 0).
+    // Arm the guard so that echo is swallowed instead of written back onto the bus -
+    // see write_state().
+    this->boot_write_guard_ = true;
     // Now allow normal control to reach the bus.
     this->writes_enabled_ = true;
     ESP_LOGD(TAG, "DALI[%d] boot state applied (on=%d, b=%.2f)",
@@ -348,6 +364,23 @@ void dali::DaliLight::write_state(light::LightState *state) {
     }
 
     state->current_values_as_binary(&on);
+
+    // One-shot boot guard: the publish in apply_boot_state() reflects the state the lamp
+    // is already in, but it also queues this write_state() call. Writing it back would be
+    // redundant at best - and if the boot read was corrupted by the bit-banged bus, it
+    // would *change* the lamp (e.g. turn on a lamp that is actually off). Swallow this
+    // first write while it still matches the published boot state; anything that differs
+    // is a real command and goes through.
+    if (this->boot_write_guard_) {
+        this->boot_write_guard_ = false;
+        bool same_state = (on == this->boot_state_.state);
+        bool same_brightness = !this->boot_state_.state ||
+            fabsf(state->current_values.get_brightness() - this->boot_state_.brightness) < 0.01f;
+        if (same_state && same_brightness) {
+            return;
+        }
+    }
+
     if (!on) {
         // Short cut: send power off command
         //bus->dali.lamp.turnOff(address_); // no fade
