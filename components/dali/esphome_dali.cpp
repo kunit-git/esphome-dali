@@ -198,9 +198,10 @@ void DaliBusComponent::loop() {
         }
     }
 
-    // Periodic status: poll and log each lamp's live state once a minute. Lamps are
-    // polled one per tick, spread across the minute, so a single loop pass never blocks
-    // on more than one lamp's worth of bus queries.
+    // Periodic status: poll each lamp's live state once a minute, log it, and sync
+    // external changes (hardware switches, other DALI masters) to Home Assistant.
+    // Lamps are polled one per tick, spread across the minute, so a single loop pass
+    // never blocks on more than one lamp's worth of bus queries.
     if (!m_lights.empty()) {
         uint32_t interval = 60000 / m_lights.size();
         uint32_t now = millis();
@@ -209,7 +210,7 @@ void DaliBusComponent::loop() {
             if (m_status_poll_index >= m_lights.size()) {
                 m_status_poll_index = 0;
             }
-            m_lights[m_status_poll_index]->log_lamp_state();
+            m_lights[m_status_poll_index]->refresh_lamp_state();
             m_status_poll_index++;
         }
     }

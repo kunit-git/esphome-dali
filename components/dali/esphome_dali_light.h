@@ -47,9 +47,10 @@ class DaliLight : public light::LightOutput, public Component {
     /// Called once by the bus component after all components have finished setup.
     void apply_boot_state();
 
-    /// @brief Query the lamp's live state from the bus and log it (on/off, level,
-    /// RGB(W) if applicable). Driven periodically by the bus component's loop().
-    void log_lamp_state();
+    /// @brief Query the lamp's live state from the bus, log it (on/off, level, RGB(W)
+    /// if applicable), and publish it to Home Assistant if it changed externally (e.g.
+    /// hardware switches). Driven periodically by the bus component's loop().
+    void refresh_lamp_state();
 
     void set_address(uint8_t address) { 
         address_ = address; 
@@ -78,16 +79,28 @@ class DaliLight : public light::LightOutput, public Component {
  protected:
     DaliBusComponent *bus;
 
-    // Boot-state handling: the bus is never written during setup. Instead we read the
-    // lamp's actual state in setup_state(), publish it via apply_boot_state(), and only
-    // then allow write_state() to drive the bus.
+    /// @brief Map a raw DALI level to the equivalent HA brightness (inverse of the
+    /// min..max + gamma mapping in write_state()); clamped to 0.01..1 so an "on" lamp
+    /// never publishes as brightness 0 (which a LightCall would coerce to "off").
+    float level_to_brightness_(uint8_t level);
+
+    /// @brief Publish a hardware-read state (on/off + brightness) to Home Assistant
+    /// without writing it back to the bus.
+    void publish_hw_state_(bool is_on, uint8_t level);
+
+    // Hardware-state reflection: the bus is never written when mirroring the lamp's
+    // actual state to Home Assistant. Used at boot (setup_state reads, apply_boot_state
+    // publishes) and by the periodic refresh_lamp_state() poll for external changes.
     light::LightState *state_{nullptr};
-    light::LightStateRTCState boot_state_{};
+    light::LightStateRTCState hw_state_{};
     bool writes_enabled_{false};
     bool boot_applied_{false};
-    // One-shot: swallow the single write_state() queued by the boot-state publish in
-    // apply_boot_state(), so reflecting the lamp's state never writes to the bus.
-    bool boot_write_guard_{false};
+    // One-shot: swallow the single write_state() queued by a hardware-state publish,
+    // so reflecting the lamp's own state never writes to the bus.
+    bool hw_write_guard_{false};
+    // millis() of the last real bus write; the periodic state sync backs off shortly
+    // after our own commands so gear-side fades aren't read back as external changes.
+    uint32_t last_write_ms_{0};
 
     uint8_t address_;
     optional<uint16_t> fade_time_;

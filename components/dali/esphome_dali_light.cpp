@@ -140,7 +140,7 @@ void dali::DaliLight::setup_state(light::LightState *state) {
             for (int attempt = 0; attempt < 3 && !is_on; attempt++) {
                 is_on = bus->dali.lamp.isLampPoweredOn(address_);
             }
-            this->boot_state_.state = is_on;
+            this->hw_state_.state = is_on;
 
             if (is_on) {
                 // Read the brightness. A single read is not trustworthy on the bit-banged
@@ -162,29 +162,8 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                     }
                 }
 
-                // Inverse of write_state()'s min..max mapping, clamped to 0..1.
-                // 0 and 0xFF (MASK) are not valid levels for a lamp we know is on -
-                // fall back to full brightness rather than guessing.
-                float brightness = 1.0f;
-                if (current_level != 0 && current_level != 0xFF &&
-                    this->dali_level_max_ > this->dali_level_min_) {
-                    brightness = (float)(current_level - this->dali_level_min_) /
-                                 (float)(this->dali_level_max_ - this->dali_level_min_);
-                    if (brightness < 0.0f) brightness = 0.0f;
-                    if (brightness > 1.0f) brightness = 1.0f;
-                    // write_state() receives a gamma-corrected brightness before mapping it
-                    // to a DALI level, so the restore must apply the inverse. Without this,
-                    // the restored value gets gamma-crushed a second time on the next
-                    // turn-on, mapping to a near-minimum DALI level that looks off.
-                    float gamma = state->get_gamma_correct();
-                    if (gamma > 0.0f) {
-                        brightness = powf(brightness, 1.0f / gamma);
-                    }
-                }
-                // A lamp sitting at its minimum level maps to brightness 0, which a
-                // LightCall would coerce back to "off" - keep it publishable as "on".
-                if (brightness < 0.01f) brightness = 0.01f;
-                this->boot_state_.brightness = brightness;
+                float brightness = this->level_to_brightness_(current_level);
+                this->hw_state_.brightness = brightness;
                 ESP_LOGD(TAG, "DALI[%.2x] Restore: on, brightness %.2f (raw level %d)",
                          address_, brightness, current_level);
             } else {
@@ -199,9 +178,9 @@ void dali::DaliLight::setup_state(light::LightState *state) {
                 uint16_t current_temperature = bus->dali.color.getColorTemperature(address_);
                 if (current_temperature != 0) {
                     // Convert mireds to 0..1 range
-                    this->boot_state_.color_temp =
+                    this->hw_state_.color_temp =
                         (current_temperature - dali_tc_coolest_) / (dali_tc_warmest_ - dali_tc_coolest_);
-                    ESP_LOGD(TAG, "Restore colour temperature: %.2f", this->boot_state_.color_temp);
+                    ESP_LOGD(TAG, "Restore colour temperature: %.2f", this->hw_state_.color_temp);
                 }
             }
 
@@ -218,7 +197,7 @@ void dali::DaliLight::setup_state(light::LightState *state) {
             // and route through the normal boot flow - apply_boot_state() publishes a safe
             // "off" to Home Assistant and then enables writes for normal control. The bus is
             // never written as a side effect of booting.
-            this->boot_state_.state = false;
+            this->hw_state_.state = false;
             bus->register_light(this);
         }
 
@@ -229,7 +208,7 @@ void dali::DaliLight::setup_state(light::LightState *state) {
         // through the suppressed boot flow so the restore never drives the bus on boot;
         // apply_boot_state() publishes "off" and then enables writes for normal control.
         // TODO: How do we detect color temperature support for broadcast and group addresses?
-        this->boot_state_.state = false;
+        this->hw_state_.state = false;
         bus->register_light(this);
     }
 
@@ -245,14 +224,82 @@ void dali::DaliLight::setup_state(light::LightState *state) {
     // }
 }
 
-void dali::DaliLight::log_lamp_state() {
+float dali::DaliLight::level_to_brightness_(uint8_t level) {
+    // Inverse of write_state()'s min..max mapping, clamped to 0..1.
+    // 0 and 0xFF (MASK) are not valid levels for a lamp we know is on -
+    // fall back to full brightness rather than guessing.
+    float brightness = 1.0f;
+    if (level != 0 && level != 0xFF && this->dali_level_max_ > this->dali_level_min_) {
+        brightness = (float)(level - this->dali_level_min_) /
+                     (float)(this->dali_level_max_ - this->dali_level_min_);
+        if (brightness < 0.0f) brightness = 0.0f;
+        if (brightness > 1.0f) brightness = 1.0f;
+        // write_state() receives a gamma-corrected brightness before mapping it
+        // to a DALI level, so this must apply the inverse. Without it, the value
+        // would get gamma-crushed a second time on the next turn-on, mapping to
+        // a near-minimum DALI level that looks off.
+        float gamma = (this->state_ != nullptr) ? this->state_->get_gamma_correct() : 1.0f;
+        if (gamma > 0.0f) {
+            brightness = powf(brightness, 1.0f / gamma);
+        }
+    }
+    // A lamp sitting at its minimum level maps to brightness 0, which a
+    // LightCall would coerce back to "off" - keep it publishable as "on".
+    if (brightness < 0.01f) brightness = 0.01f;
+    return brightness;
+}
+
+void dali::DaliLight::publish_hw_state_(bool is_on, uint8_t level) {
+    if (this->state_ == nullptr || !this->writes_enabled_) {
+        return; // Boot flow (apply_boot_state) handles the initial publish
+    }
+
+    // Back off shortly after our own commands: a DAPC starts a gear-side fade that can
+    // take seconds, and syncing an intermediate level back to HA would look like an
+    // external change (and publish a value the user never picked).
+    if ((uint32_t)(millis() - this->last_write_ms_) < 10000) {
+        return;
+    }
+
+    float brightness = is_on ? this->level_to_brightness_(level) : this->hw_state_.brightness;
+
+    const auto& remote = this->state_->remote_values;
+    bool changed = (is_on != remote.is_on()) ||
+                   (is_on && fabsf(brightness - remote.get_brightness()) > 0.03f);
+    if (!changed) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "DALI[%.2x] External change detected, updating HA: %s (brightness %.2f)",
+             address_, is_on ? "ON" : "OFF", brightness);
+
+    this->hw_state_.state = is_on;
+    if (is_on) {
+        this->hw_state_.brightness = brightness;
+    }
+
+    auto call = this->state_->make_call();
+    call.set_state(is_on);
+    if (is_on) {
+        call.set_brightness_if_supported(brightness);
+    }
+    call.set_save(false);
+    call.set_publish(true);
+    // No transition: this reflects a state the lamp already has.
+    call.set_transition_length(0);
+    call.perform();
+    // Swallow the write_state() echo queued by the perform() - see write_state().
+    this->hw_write_guard_ = true;
+}
+
+void dali::DaliLight::refresh_lamp_state() {
     if ((this->address_ == ADDR_BROADCAST) || ((this->address_ & ADDR_GROUP_MASK) != 0)) {
         return; // No single lamp state to read for group/broadcast addresses
     }
 
     // Live status poll, driven once a minute per lamp from the bus loop(). Queries are
-    // deliberately single-shot (no retry loops): this is informational logging, and each
-    // extra query blocks the main loop for another bus frame round-trip.
+    // deliberately single-shot (no retry loops): each extra query blocks the main loop
+    // for another bus frame round-trip.
     // Raw bytes are included for bus diagnostics: power_on answers "yes" as exactly
     // 0xFF ("no" = no reply, reads 0); status bit2 mirrors "lamp arc power on".
     uint8_t power_on = bus->sendQueryCommand(address_, DaliCommand::QUERY_LAMP_POWER_ON);
@@ -261,10 +308,13 @@ void dali::DaliLight::log_lamp_state() {
     if (power_on != 0xFF) {
         ESP_LOGI(TAG, "DALI[%.2x] Lamp state: OFF (power_on=0x%02x, status=0x%02x)",
                  address_, power_on, status);
+        this->publish_hw_state_(false, 0);
         return;
     }
 
     uint8_t level = bus->dali.lamp.getCurrentLevel(address_);
+    this->publish_hw_state_(true, level);
+
     if (rgb_supported_) {
         uint8_t r = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportRedDimLevel);
         uint8_t g = bus->dali.color.getReportedDimLevel(address_, DaliColorParam::ReportGreenDimLevel);
@@ -290,12 +340,12 @@ void dali::DaliLight::apply_boot_state() {
 
     // Publish the lamp's actual hardware state to Home Assistant. NOTE: the LightCall
     // queues one write_state() for the *next* loop iteration - after writes_enabled_ has
-    // been flipped below - so the boot_write_guard_ set below is what actually keeps this
+    // been flipped below - so the hw_write_guard_ set below is what actually keeps this
     // publish off the bus. The physical lamp keeps whatever state it powered up in.
     if (this->state_ != nullptr) {
         auto call = this->state_->make_call();
-        call.set_state(this->boot_state_.state);
-        call.set_brightness_if_supported(this->boot_state_.brightness);
+        call.set_state(this->hw_state_.state);
+        call.set_brightness_if_supported(this->hw_state_.brightness);
         // NOTE: color temperature is intentionally not forced here, to avoid unit ambiguity
         // in the LightCall. On/off + brightness are the states we must get right.
         call.set_save(false);
@@ -311,11 +361,11 @@ void dali::DaliLight::apply_boot_state() {
     // The perform() above queued exactly one write_state() (immediate, transition 0).
     // Arm the guard so that echo is swallowed instead of written back onto the bus -
     // see write_state().
-    this->boot_write_guard_ = true;
+    this->hw_write_guard_ = true;
     // Now allow normal control to reach the bus.
     this->writes_enabled_ = true;
     ESP_LOGD(TAG, "DALI[%d] boot state applied (on=%d, b=%.2f)",
-             address_, this->boot_state_.state, this->boot_state_.brightness);
+             address_, this->hw_state_.state, this->hw_state_.brightness);
 }
 
 light::LightTraits dali::DaliLight::get_traits() {
@@ -416,17 +466,17 @@ void dali::DaliLight::write_state(light::LightState *state) {
 
     state->current_values_as_binary(&on);
 
-    // One-shot boot guard: the publish in apply_boot_state() reflects the state the lamp
-    // is already in, but it also queues this write_state() call. Writing it back would be
-    // redundant at best - and if the boot read was corrupted by the bit-banged bus, it
-    // would *change* the lamp (e.g. turn on a lamp that is actually off). Swallow this
-    // first write while it still matches the published boot state; anything that differs
-    // is a real command and goes through.
-    if (this->boot_write_guard_) {
-        this->boot_write_guard_ = false;
-        bool same_state = (on == this->boot_state_.state);
-        bool same_brightness = !this->boot_state_.state ||
-            fabsf(state->current_values.get_brightness() - this->boot_state_.brightness) < 0.01f;
+    // One-shot hardware-state guard: publishes in apply_boot_state() and
+    // publish_hw_state_() reflect a state the lamp already has, but they also queue this
+    // write_state() call. Writing it back would be redundant at best - and if the read
+    // was corrupted by the bit-banged bus, it would *change* the lamp (e.g. turn on a
+    // lamp that is actually off). Swallow this one write while it still matches the
+    // published hardware state; anything that differs is a real command and goes through.
+    if (this->hw_write_guard_) {
+        this->hw_write_guard_ = false;
+        bool same_state = (on == this->hw_state_.state);
+        bool same_brightness = !this->hw_state_.state ||
+            fabsf(state->current_values.get_brightness() - this->hw_state_.brightness) < 0.01f;
         if (same_state && same_brightness) {
             return;
         }
@@ -435,6 +485,7 @@ void dali::DaliLight::write_state(light::LightState *state) {
     if (!on) {
         // Short cut: send power off command
         //bus->dali.lamp.turnOff(address_); // no fade
+        this->last_write_ms_ = millis();
         bus->dali.lamp.setBrightness(address_, 0); // fade
         return;
     }
@@ -510,5 +561,6 @@ void dali::DaliLight::write_state(light::LightState *state) {
     if (dali_brightness > 254) dali_brightness = 254;
 
     ESP_LOGD(TAG, "DALI[%d] B=%.2f (%d)", address_, brightness, dali_brightness);
+    this->last_write_ms_ = millis();
     bus->dali.lamp.setBrightness(address_, (uint8_t)dali_brightness);
 }
